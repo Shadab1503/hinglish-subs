@@ -1,123 +1,157 @@
+import os
+import tempfile
+import shutil
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import shutil, os, uuid, subprocess
-
-from audio_extractor import extract_audio
+from fastapi.responses import StreamingResponse
 from transcribe import transcribe_hinglish, transcribe_urdu_english
-from srt_builder import build_srt, build_vtt, build_ass
+from srt_builder import build_srt
 
-app = FastAPI(title="HinglishSubs API")
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+MAX_FILE_SIZE_MB = 500
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    os.getenv("FRONTEND_URL", "https://front-end-production-d335.up.railway.app"),
+]
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Lifespan — warm up model on startup
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 Starting Hinglish Subtitles API...")
+    # Pre-load the Whisper model so the first request isn't slow
+    from transcribe import get_model
+    get_model()
+    logger.info("✅ Whisper model loaded and ready")
+    yield
+    logger.info("👋 Shutting down...")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="Hinglish Subtitles API",
+    version="1.1.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "C:/tmp/hinglish_subs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def validate_file(filename: str, size: int) -> None:
+    """Validate file extension and size before processing."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+    if size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({size / 1024 / 1024:.0f} MB). Max: {MAX_FILE_SIZE_MB} MB",
+        )
+
+
+def iter_file_then_cleanup(file_path: str, temp_dir: str):
+    """Stream the file contents, then delete the temp directory."""
+    try:
+        with open(file_path, "rb") as f:
+            yield from f
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.info(f"🧹 Cleaned up temp dir: {temp_dir}")
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "1.1.0"}
 
 
 @app.post("/transcribe")
 async def transcribe(
-    file:     UploadFile = File(...),
-    language: str        = Form("hinglish"),
-    format:   str        = Form("srt"),
-    style:    str        = Form("yellow_impact")
+    file: UploadFile = File(...),
+    language: str = Form("hinglish"),
 ):
-    ext      = file.filename.rsplit(".", 1)[-1]
-    job_id   = str(uuid.uuid4())
-    vid_path = f"{UPLOAD_DIR}/{job_id}.{ext}"
+    # Read file into memory first to check size
+    contents = await file.read()
+    validate_file(file.filename or "unknown.mp4", len(contents))
 
-    with open(vid_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # Save to temp directory
+    temp_dir = tempfile.mkdtemp(prefix="hinglish_")
+    safe_name = file.filename.replace("/", "_").replace("\\", "_") if file.filename else "upload.mp4"
+    file_path = os.path.join(temp_dir, safe_name)
 
     try:
-        audio_path = extract_audio(vid_path)
-        result     = transcribe_urdu_english(audio_path) if language == "urdu" \
-                     else transcribe_hinglish(audio_path)
-        segments   = result.get("segments") or \
-                     [{"start": 0, "end": result.get("total_time", 10),
-                       "text": result.get("text", "")}]
+        with open(file_path, "wb") as f:
+            f.write(contents)
 
-        if format == "vtt":
-            content, mime, fname = build_vtt(segments), "text/vtt", f"subtitles_{language}.vtt"
-        elif format == "ass":
-            content, mime, fname = build_ass(segments, style=style), "text/plain", f"subtitles_{language}.ass"
+        logger.info(f"📝 Transcribing '{safe_name}' ({len(contents) / 1024 / 1024:.1f} MB) in '{language}' mode")
+
+        # Transcribe
+        if language == "hinglish":
+            result = transcribe_hinglish(file_path)
+        elif language in ("english", "urdu_english"):
+            result = transcribe_urdu_english(file_path)
         else:
-            content, mime, fname = build_srt(segments), "text/plain", f"subtitles_{language}.srt"
+            raise HTTPException(status_code=400, detail=f"Unknown language: {language}")
 
-        return Response(
-            content=content, media_type=mime,
-            headers={"Content-Disposition": f"attachment; filename={fname}"}
+        if not result["segments"]:
+            raise HTTPException(status_code=422, detail="No speech detected in the file")
+
+        # Build SRT
+        srt_content = build_srt(result["segments"])
+        output_path = os.path.join(temp_dir, "subtitles.srt")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        logger.info(f"✅ Generated {len(result['segments'])} subtitle segments")
+
+        # Stream response — cleanup happens AFTER streaming finishes
+        return StreamingResponse(
+            iter_file_then_cleanup(output_path, temp_dir),
+            media_type="application/x-subrip",
+            headers={
+                "Content-Disposition": 'attachment; filename="subtitles.srt"',
+                "X-Segment-Count": str(len(result["segments"])),
+            },
         )
+
+    except HTTPException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        for p in [vid_path, vid_path.rsplit(".", 1)[0] + "_audio.wav"]:
-            if os.path.exists(p): os.remove(p)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.error(f"❌ Transcription failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
-@app.post("/render")
-async def render(
-    file:     UploadFile = File(...),
-    language: str        = Form("hinglish"),
-    style:    str        = Form("yellow_impact")
-):
-    ext      = file.filename.rsplit(".", 1)[-1]
-    job_id   = str(uuid.uuid4())
-    vid_path = f"{UPLOAD_DIR}/{job_id}.{ext}"
-    ass_path = f"{UPLOAD_DIR}/{job_id}.ass"
-
-    with open(vid_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    try:
-        audio_path = extract_audio(vid_path)
-        result     = transcribe_urdu_english(audio_path) if language == "urdu" \
-                     else transcribe_hinglish(audio_path)
-        segments   = result.get("segments") or []
-
-        ass_content = build_ass(segments, style=style)
-        with open(ass_path, "w", encoding="utf-8") as f:
-            f.write(ass_content)
-
-        force_styles = {
-            "yellow_impact": "FontName=Impact,FontSize=90,PrimaryColour=&H0000EEFF,OutlineColour=&H00000000,Bold=1,Outline=4,Shadow=2,Alignment=2,MarginV=350",
-            "green_outline": "FontName=Impact,FontSize=90,PrimaryColour=&H0000DD00,OutlineColour=&H00000000,Bold=1,Outline=4,Shadow=0,Alignment=2,MarginV=350",
-            "blue_box":      "FontName=Arial,FontSize=85,PrimaryColour=&H00FFFFFF,OutlineColour=&H00E85C1A,Bold=1,BorderStyle=3,Outline=0,Alignment=2,MarginV=350",
-            "classic":       "FontName=Arial,FontSize=80,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Bold=1,Outline=4,Shadow=2,Alignment=2,MarginV=350",
-        }
-        fs = force_styles.get(style, force_styles["yellow_impact"])
-
-        simple_ass = f"{job_id}.ass"
-        simple_out = f"{job_id}_output.mp4"
-
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", vid_path,
-            "-vf", f"subtitles={simple_ass}:force_style='{fs}'",
-            "-c:a", "copy",
-            simple_out
-        ], check=True, cwd=UPLOAD_DIR)
-
-        out_path = f"{UPLOAD_DIR}/{simple_out}"
-
-        return FileResponse(
-            out_path,
-            media_type="video/mp4",
-            filename="hinglishsubs_output.mp4"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        for p in [vid_path, ass_path,
-                  vid_path.rsplit(".", 1)[0] + "_audio.wav"]:
-            if os.path.exists(p): os.remove(p)
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
